@@ -34,9 +34,9 @@ This node takes a sequence of images (video frames) and processes them to output
 *   **`window_size`**: (Integer, Default: 14) The number of consecutive frames processed together in a sliding window. Affects temporal consistency.
 *   **`time_step_size`**: (Integer, Default: 10) How many frames the sliding window moves forward after processing a chunk. If less than `window_size`, frames will overlap, potentially improving smoothness.
 *   **`decode_chunk_size`**: (Integer, Default: 4) Number of latent frames decoded by the VAE at once. Primarily a VRAM management setting.
-*   **`fps_for_time_ids`**: (Integer, Default: 7) Conditions the model on an intended Frames Per Second, influencing motion characteristics in the generated normals.
-*   **`motion_bucket_id`**: (Integer, Default: 127) Conditions the model on an expected amount of motion.
-*   **`noise_aug_strength`**: (Float, Default: 0.0) Strength of noise augmentation applied to conditioning information. *Note: In testing, this parameter showed minimal to no visible effect on the output for this specific model and task.*
+*   **`fps_for_time_ids`**: (Integer, Default: 7) Conditions the model on an intended Frames Per Second, influencing motion characteristics in the generated normals. *Note: In testing, this parameter showed minimal to no visible effect on the output for this specific model and task. As such I hard coded the value*
+*   **`motion_bucket_id`**: (Integer, Default: 127) Conditions the model on an expected amount of motion. *Note: In testing, this parameter showed minimal to no visible effect on the output for this specific model and task. As such I hard coded the value*
+*   **`noise_aug_strength`**: (Float, Default: 0.0) Strength of noise augmentation applied to conditioning information. *Note: In testing, this parameter showed minimal to no visible effect on the output for this specific model and task. As such I hard coded the value*
 
 ### Troubleshooting Flicker / Improving Temporal Consistency
 
