@@ -14,7 +14,7 @@ It allows you to generate temporally consistent normal map sequences from input 
 2.  Install the required dependencies. Navigate to the `ComfyUI-NormalCrafter` directory and install using the `requirements.txt`:
     ```bash
     ACTIVATE YOUR VENV FIRST
-    cd ComfyUI-NormalCrafter
+    ComfyUI-NormalCrafterWrapper
     pip install -r requirements.txt
     ```
     (See the `requirements.txt` for notes on the `diffusers` dependency, which ComfyUI often manages.)
