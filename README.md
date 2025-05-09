@@ -9,10 +9,11 @@ It allows you to generate temporally consistent normal map sequences from input 
 1.  Clone this repository into your `ComfyUI/custom_nodes/` directory:
     ```bash
     cd ComfyUI/custom_nodes/
-    git clone https://github.com/YOUR_USERNAME/ComfyUI-NormalCrafter.git # Replace with your actual repo URL
+    git clone https://github.com/AIWarper/ComfyUI-NormalCrafterWrapper.git # Replace with your actual repo URL
     ```
 2.  Install the required dependencies. Navigate to the `ComfyUI-NormalCrafter` directory and install using the `requirements.txt`:
     ```bash
+    ACTIVATE YOUR VENV FIRST
     cd ComfyUI-NormalCrafter
     pip install -r requirements.txt
     ```
