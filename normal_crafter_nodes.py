@@ -88,66 +88,70 @@ class NormalCrafterNode:
             pass
         return local_nc_path
 
-    def _load_pipeline(self, device_str="cuda", dtype_str="float16"):
+    def _load_pipeline(self, device_str_requested="cuda", dtype_str_requested="float16"):
         global NORMALCRAFTER_PIPE, CURRENT_PIPE_CONFIG
 
-        # This is the configuration requested for the *current* run
-        requested_config = {
-            "device": device_str,
-            "dtype": dtype_str,
-        }
+        target_device_for_this_run = comfy.model_management.get_torch_device() if device_str_requested == "cuda" else torch.device("cpu")
+        
+        # Determine the torch_dtype we want for this run
+        if dtype_str_requested == "float16": final_torch_dtype_for_load = torch.float16
+        elif dtype_str_requested == "bf16": final_torch_dtype_for_load = torch.bfloat16
+        else: final_torch_dtype_for_load = torch.float32
 
-        # If pipe exists and its last known config matches what's requested for *this* run
-        if NORMALCRAFTER_PIPE is not None and CURRENT_PIPE_CONFIG == requested_config:
-            target_device_for_this_run = comfy.model_management.get_torch_device() if device_str == "cuda" else torch.device("cpu")
-            # Safety check: ensure it's actually on the target_device_for_this_run.
-            # This handles cases where ComfyUI might have moved it, or if our offload didn't update CURRENT_PIPE_CONFIG.
-            # However, with proper CURRENT_PIPE_CONFIG updates, this `if` might rarely trigger if CURRENT_PIPE_CONFIG already reflects "cpu".
-            if NORMALCRAFTER_PIPE.device != target_device_for_this_run:
-                 print(f"ComfyUI-NormalCrafter: Moving existing pipeline from {NORMALCRAFTER_PIPE.device} to {target_device_for_this_run}.")
-                 NORMALCRAFTER_PIPE.to(target_device_for_this_run)
-            self.pipe = NORMALCRAFTER_PIPE
-            return self.pipe
+        if NORMALCRAFTER_PIPE is not None:
+            # Pipe exists. Check if its current dtype and target device are suitable.
+            pipe_actual_dtype = NORMALCRAFTER_PIPE.dtype # The true dtype of the existing pipe
+            pipe_actual_dtype_str = "float16" if pipe_actual_dtype == torch.float16 else \
+                                    "bf16" if pipe_actual_dtype == torch.bfloat16 else "float32"
 
-        # If pipe doesn't exist, or its last known config (CURRENT_PIPE_CONFIG)
-        # is different from what's requested for this run (e.g., it was on CPU, now GPU is requested),
-        # then we proceed to load/reload.
-
-        print("ComfyUI-NormalCrafter: Loading NormalCrafter pipeline...")
+            if dtype_str_requested == pipe_actual_dtype_str:
+                # Dtypes match. Just check device.
+                if NORMALCRAFTER_PIPE.device != target_device_for_this_run:
+                    print(f"ComfyUI-NormalCrafter: Moving existing pipeline from {NORMALCRAFTER_PIPE.device} to {target_device_for_this_run}.")
+                    NORMALCRAFTER_PIPE.to(target_device_for_this_run) 
+                    # The warning about fp16 on cpu will appear here if target_device_for_this_run is cpu, 
+                    # but we're moving an fp16 pipe from cpu to gpu in the typical reload case, which is fine.
+                
+                CURRENT_PIPE_CONFIG = {"device": str(target_device_for_this_run), "dtype": dtype_str_requested}
+                self.pipe = NORMALCRAFTER_PIPE
+                # print(f"ComfyUI-NormalCrafter: Reusing existing pipeline. Now on {target_device_for_this_run} with {dtype_str_requested}.")
+                return self.pipe
+            else:
+                # Dtype mismatch (e.g., user wants float32 now, but pipe is float16). Must reload fully.
+                print(f"ComfyUI-NormalCrafter: Requested dtype {dtype_str_requested} differs from existing pipe's dtype {pipe_actual_dtype_str}. Reloading pipeline.")
+                NORMALCRAFTER_PIPE = None # Force a full reload by clearing the global pipe
+        
+        # If NORMALCRAFTER_PIPE is None (either initially, or forced by dtype mismatch above)
+        print("ComfyUI-NormalCrafter: Loading/Re-loading NormalCrafter pipeline from scratch...")
         local_nc_model_path = self._download_normalcrafter_model_if_needed()
 
-        if dtype_str == "float16": torch_dtype = torch.float16
-        elif dtype_str == "bf16": torch_dtype = torch.bfloat16
-        else: torch_dtype = torch.float32
-
-        print(f"ComfyUI-NormalCrafter: Loading UNet from subfolder 'unet' in {local_nc_model_path}")
+        # Load components with final_torch_dtype_for_load
         unet = DiffusersUNetSpatioTemporalConditionModelNormalCrafter.from_pretrained(
-            local_nc_model_path, subfolder="unet", low_cpu_mem_usage=True, torch_dtype=torch_dtype # Initially load to CPU
+            local_nc_model_path, subfolder="unet", low_cpu_mem_usage=True, torch_dtype=final_torch_dtype_for_load
         )
-        print(f"ComfyUI-NormalCrafter: Loading VAE from subfolder 'vae' in {local_nc_model_path}")
         vae = AutoencoderKLTemporalDecoder.from_pretrained(
-            local_nc_model_path, subfolder="vae", low_cpu_mem_usage=True, torch_dtype=torch_dtype # Initially load to CPU
+            local_nc_model_path, subfolder="vae", low_cpu_mem_usage=True, torch_dtype=final_torch_dtype_for_load
         )
+        svd_xt_variant = "fp16" if final_torch_dtype_for_load == torch.float16 else None
 
-        svd_xt_variant = "fp16" if torch_dtype == torch.float16 else None
-        print(f"ComfyUI-NormalCrafter: Loading base SVD pipeline ({SVD_XT_REPO_ID}) and integrating custom UNet/VAE.")
         pipe = NormalCrafterPipeline.from_pretrained(
-            SVD_XT_REPO_ID, unet=unet, vae=vae, torch_dtype=torch_dtype, variant=svd_xt_variant,
+            SVD_XT_REPO_ID, unet=unet, vae=vae, torch_dtype=final_torch_dtype_for_load, variant=svd_xt_variant,
         )
 
-        target_device_for_this_run = comfy.model_management.get_torch_device() if device_str == "cuda" else torch.device("cpu")
         try:
             pipe.enable_xformers_memory_efficient_attention()
-            print("ComfyUI-NormalCrafter: Xformers memory efficient attention enabled.")
-        except Exception as e:
-            print(f"ComfyUI-NormalCrafter: Xformers not available or failed to enable: {e}. Proceeding without it.")
-            # Consider pipe.enable_attention_slicing() as a fallback if VRAM is an issue during processing
+            # print("ComfyUI-NormalCrafter: Xformers memory efficient attention enabled.") # Already printed during first load often
+        except Exception: # Simplified error handling
+            pass
 
-        pipe.to(target_device_for_this_run) # Move the newly loaded pipe to the target device
+        pipe.to(target_device_for_this_run)
         NORMALCRAFTER_PIPE = pipe
-        CURRENT_PIPE_CONFIG = requested_config # Update global config to reflect the state of the loaded pipe
+        CURRENT_PIPE_CONFIG = {
+            "device": str(target_device_for_this_run),
+            "dtype": dtype_str_requested # The dtype it's configured with for this run
+        }
         self.pipe = NORMALCRAFTER_PIPE
-        print(f"ComfyUI-NormalCrafter: Pipeline loaded to {target_device_for_this_run} with dtype {torch_dtype}.")
+        print(f"ComfyUI-NormalCrafter: Pipeline loaded to {target_device_for_this_run} with dtype {final_torch_dtype_for_load}.")
         return self.pipe
 
     def tensor_to_pil_list(self, images_tensor: torch.Tensor) -> list:
