@@ -1,11 +1,13 @@
 # ComfyUI/custom_nodes/ComfyUI-NormalCrafter/normal_crafter_nodes.py
 
 import torch
+import torchvision.transforms as transforms
 import numpy as np
 from PIL import Image
 import os
 
 import comfy.model_management
+import model_management
 import comfy.utils
 import folder_paths # ComfyUI's way to get model paths
 
@@ -34,6 +36,104 @@ NORMALCRAFTER_REPO_ID = "Yanrui95/NormalCrafter"
 NORMALCRAFTER_MODELS_SUBDIR_NAME = "normalcrafter_models" # Subdirectory in ComfyUI/models/
 SVD_XT_REPO_ID = "stabilityai/stable-video-diffusion-img2vid-xt"
 
+class DetailTransfer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "target": ("IMAGE", ),
+                "source": ("IMAGE", ),
+                "mode": ([
+                    "add",
+                    "multiply",
+                    "screen",
+                    "overlay",
+                    "soft_light",
+                    "hard_light",
+                    "color_dodge",
+                    "color_burn",
+                    "difference",
+                    "exclusion",
+                    "divide",
+                    
+                    ], 
+                    {"default": "add"}
+                    ),
+                "blur_sigma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 100.0, "step": 0.01}),
+                "blend_factor": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.001,  "round": 0.001}),
+            },
+            "optional": {
+                "mask": ("MASK", ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "process"
+    CATEGORY = "NormalCrafter"
+
+    def adjust_mask(self, mask, target_tensor):
+        # Add a channel dimension and repeat to match the channel number of the target tensor
+        if len(mask.shape) == 3:
+            mask = mask.unsqueeze(1)  # Add a channel dimension
+            target_channels = target_tensor.shape[1]
+            mask = mask.expand(-1, target_channels, -1, -1)  # Expand the channel dimension to match the target tensor's channels
+    
+        return mask
+
+
+    def process(self, target, source, mode, blur_sigma, blend_factor, mask=None):
+        B, H, W, C = target.shape
+        device = model_management.get_torch_device()
+        target_tensor = target.permute(0, 3, 1, 2).clone().to(device)
+        source_tensor = source.permute(0, 3, 1, 2).clone().to(device)
+
+        if target.shape[1:] != source.shape[1:]:
+            source_tensor = comfy.utils.common_upscale(source_tensor, W, H, "bilinear", "disabled")
+
+        if source.shape[0] < B:
+            source = source[0].unsqueeze(0).repeat(B, 1, 1, 1)
+
+        kernel_size = int(6 * int(blur_sigma) + 1)
+
+        gaussian_blur = transforms.GaussianBlur(kernel_size=(kernel_size, kernel_size), sigma=(blur_sigma, blur_sigma))
+
+        blurred_target = gaussian_blur(target_tensor)
+        blurred_source = gaussian_blur(source_tensor)
+        
+        if mode == "add":
+            tensor_out = (source_tensor - blurred_source) + blurred_target
+        elif mode == "multiply":
+            tensor_out = source_tensor * blurred_target
+        elif mode == "screen":
+            tensor_out = 1 - (1 - source_tensor) * (1 - blurred_target)
+        elif mode == "overlay":
+            tensor_out = torch.where(blurred_target < 0.5, 2 * source_tensor * blurred_target, 1 - 2 * (1 - source_tensor) * (1 - blurred_target))
+        elif mode == "soft_light":
+            tensor_out = (1 - 2 * blurred_target) * source_tensor**2 + 2 * blurred_target * source_tensor
+        elif mode == "hard_light":
+            tensor_out = torch.where(source_tensor < 0.5, 2 * source_tensor * blurred_target, 1 - 2 * (1 - source_tensor) * (1 - blurred_target))
+        elif mode == "difference":
+            tensor_out = torch.abs(blurred_target - source_tensor)
+        elif mode == "exclusion":
+            tensor_out = 0.5 - 2 * (blurred_target - 0.5) * (source_tensor - 0.5)
+        elif mode == "color_dodge":
+            tensor_out = blurred_target / (1 - source_tensor)
+        elif mode == "color_burn":
+            tensor_out = 1 - (1 - blurred_target) / source_tensor
+        elif mode == "divide":
+            tensor_out = (source_tensor / blurred_source) * blurred_target
+        else:
+            tensor_out = source_tensor
+        
+        tensor_out = torch.lerp(target_tensor, tensor_out, blend_factor)
+        if mask is not None:
+            # Call the function and pass in mask and target_tensor
+            mask = self.adjust_mask(mask, target_tensor)
+            mask = mask.to(device)
+            tensor_out = torch.lerp(target_tensor, tensor_out, mask)
+        tensor_out = torch.clamp(tensor_out, 0, 1)
+        tensor_out = tensor_out.permute(0, 2, 3, 1).cpu().float()
+        return (tensor_out,)
 
 class NormalCrafterNode:
     def __init__(self):
@@ -58,7 +158,7 @@ class NormalCrafterNode:
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "process"
-    CATEGORY = "Video/NormalCrafter"
+    CATEGORY = "NormalCrafter"
 
     def _get_local_nc_model_path(self):
         base_models_dir = os.path.join(folder_paths.models_dir, NORMALCRAFTER_MODELS_SUBDIR_NAME)
