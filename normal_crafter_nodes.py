@@ -5,11 +5,18 @@ import torchvision.transforms as transforms
 import numpy as np
 from PIL import Image
 import os
+import logging
 
 import comfy.model_management
 import model_management
 import comfy.utils
 import folder_paths # ComfyUI's way to get model paths
+
+# Handle PIL version compatibility
+try:
+    LANCZOS = Image.Resampling.LANCZOS
+except AttributeError:
+    LANCZOS = Image.LANCZOS
 
 # Try to import required components and provide guidance if they are missing
 try:
@@ -138,6 +145,7 @@ class DetailTransfer:
 class NormalCrafterNode:
     def __init__(self):
         self.pipe = None # Instance variable for the pipeline
+        self.last_processed_dimensions = None # Track last processed dimensions
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -150,6 +158,7 @@ class NormalCrafterNode:
                 "time_step_size": ("INT", {"default": 10, "min": 1, "max": 64}),
                 "decode_chunk_size": ("INT", {"default": 4, "min": 1, "max": 64}),
                 "offload_pipe_to_cpu_on_finish": ("BOOLEAN", {"default": True}), # <<< NEW INPUT
+                "use_xformers": (["auto", "disable", "force"], {"default": "auto"}), # <<< NEW INPUT
             },
             "optional": {
                 "pipe_override": ("NORMALCRAFTER_PIPE",),
@@ -188,7 +197,39 @@ class NormalCrafterNode:
             pass
         return local_nc_path
 
-    def _load_pipeline(self, device_str_requested="cuda", dtype_str_requested="float16"):
+    def _configure_xformers(self, pipe, use_xformers="auto"):
+        """
+        Configures xformers memory efficient attention for a given pipeline.
+        Handles 'auto', 'disable', and 'force' modes.
+        """
+        if use_xformers == "disable":
+            if hasattr(pipe, 'disable_xformers_memory_efficient_attention'):
+                print("ComfyUI-NormalCrafter: Xformers memory efficient attention disabled.")
+                try:
+                    pipe.disable_xformers_memory_efficient_attention()
+                except Exception as e:
+                    print(f"ComfyUI-NormalCrafter: Warning - could not disable xformers: {e}")
+            else:
+                print("ComfyUI-NormalCrafter: Pipeline does not support disabling xformers.")
+        elif use_xformers == "force":
+            if hasattr(pipe, 'enable_xformers_memory_efficient_attention'):
+                print("ComfyUI-NormalCrafter: Xformers memory efficient attention forced on.")
+                pipe.enable_xformers_memory_efficient_attention()
+            else:
+                print("ComfyUI-NormalCrafter: Warning - Pipeline does not support xformers, but 'force' was requested.")
+        else: # "auto" or any other value
+            if hasattr(pipe, 'enable_xformers_memory_efficient_attention'):
+                try:
+                    pipe.enable_xformers_memory_efficient_attention()
+                    print("ComfyUI-NormalCrafter: Xformers memory efficient attention enabled (auto).")
+                except Exception as e:
+                    print(f"ComfyUI-NormalCrafter: Failed to enable Xformers memory efficient attention: {e}. Using standard attention.")
+                    # If xformers fails, we can still use standard attention
+                    pass
+            else:
+                print("ComfyUI-NormalCrafter: Pipeline does not support xformers. Using standard attention.")
+
+    def _load_pipeline(self, device_str_requested="cuda", dtype_str_requested="float16", use_xformers="auto"):
         global NORMALCRAFTER_PIPE, CURRENT_PIPE_CONFIG
 
         target_device_for_this_run = comfy.model_management.get_torch_device() if device_str_requested == "cuda" else torch.device("cpu")
@@ -214,6 +255,8 @@ class NormalCrafterNode:
                 
                 CURRENT_PIPE_CONFIG = {"device": str(target_device_for_this_run), "dtype": dtype_str_requested}
                 self.pipe = NORMALCRAFTER_PIPE
+                # Configure xformers for existing pipe
+                self._configure_xformers(NORMALCRAFTER_PIPE, use_xformers)
                 # print(f"ComfyUI-NormalCrafter: Reusing existing pipeline. Now on {target_device_for_this_run} with {dtype_str_requested}.")
                 return self.pipe
             else:
@@ -238,11 +281,8 @@ class NormalCrafterNode:
             SVD_XT_REPO_ID, unet=unet, vae=vae, torch_dtype=final_torch_dtype_for_load, variant=svd_xt_variant,
         )
 
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-            # print("ComfyUI-NormalCrafter: Xformers memory efficient attention enabled.") # Already printed during first load often
-        except Exception: # Simplified error handling
-            pass
+        # Configure xformers with our robust handler
+        self._configure_xformers(pipe, use_xformers)
 
         pipe.to(target_device_for_this_run)
         NORMALCRAFTER_PIPE = pipe
@@ -261,6 +301,38 @@ class NormalCrafterNode:
             pil_images.append(Image.fromarray(img_np))
         return pil_images
 
+    def _validate_dimensions_for_attention(self, width: int, height: int) -> tuple:
+        """
+        Validates and adjusts dimensions to be compatible with flash attention requirements.
+        Returns (safe_width, safe_height, needs_adjustment) tuple.
+        """
+        # Flash attention typically requires dimensions divisible by 8 or 16
+        # and the total elements to be within certain bounds
+        
+        # After VAE encoding, dimensions will be divided by 8
+        latent_width = width // 8
+        latent_height = height // 8
+        
+        # Common constraints for flash attention
+        min_dim = 2  # Minimum dimension after encoding
+        alignment = 8  # Dimension alignment requirement
+        
+        # Check if dimensions are safe
+        if latent_width < min_dim or latent_height < min_dim:
+            # Dimensions too small
+            safe_width = max(width, min_dim * 8)
+            safe_height = max(height, min_dim * 8)
+            return safe_width, safe_height, True
+        
+        # Check alignment
+        if latent_width % alignment != 0 or latent_height % alignment != 0:
+            # Need alignment adjustment
+            safe_width = ((latent_width + alignment - 1) // alignment) * alignment * 8
+            safe_height = ((latent_height + alignment - 1) // alignment) * alignment * 8
+            return safe_width, safe_height, True
+            
+        return width, height, False
+
     def resize_pil_images(self, pil_images: list, max_res_dim: int) -> list:
         resized_images = []
         if not pil_images: return []
@@ -273,12 +345,13 @@ class NormalCrafterNode:
             else:
                 target_height = original_height
                 target_width = original_width
-            resized_images.append(img.resize((target_width, target_height), Image.LANCZOS))
+            resized_images.append(img.resize((target_width, target_height), LANCZOS))
         return resized_images
 
     def process(self, images: torch.Tensor, seed: int, max_res_dimension: int,
                 window_size: int, time_step_size: int, decode_chunk_size: int,
                 offload_pipe_to_cpu_on_finish: bool, # <<< NEW PARAMETER
+                use_xformers: str = "auto", # <<< NEW PARAMETER
                 pipe_override=None):
 
         default_fps_for_time_ids = 7
@@ -293,7 +366,7 @@ class NormalCrafterNode:
             device_str = "cuda" if current_comfy_device.type == 'cuda' else "cpu"
             # Determine dtype based on device (float16 for CUDA, float32 for CPU)
             dtype_str = "float16" if device_str == "cuda" and comfy.model_management.should_use_fp16() else "float32"
-            self._load_pipeline(device_str, dtype_str)
+            self._load_pipeline(device_str, dtype_str, use_xformers)
 
         if self.pipe is None:
             raise RuntimeError("ComfyUI-NormalCrafter: Pipeline could not be loaded.")
@@ -333,18 +406,100 @@ class NormalCrafterNode:
 
         pbar = comfy.utils.ProgressBar(len(effective_frames_for_pipeline)) # This pbar seems not used by the pipe.
 
-        with torch.inference_mode():
-            output_frames_np = self.pipe( # self.pipe should be on processing_device here
-                images=effective_frames_for_pipeline,
-                decode_chunk_size=decode_chunk_size,
-                time_step_size=time_step_size,
-                window_size=window_size,
-                fps=default_fps_for_time_ids,
-                motion_bucket_id=default_motion_bucket_id,
-                noise_aug_strength=default_noise_aug_strength,
-                generator=generator
-                # SVD pipeline has its own progress bar, no need to pass pbar here
-            ).frames[0]
+        # Check dimensions before processing
+        if resized_pil_frames:
+            first_frame_width, first_frame_height = resized_pil_frames[0].size
+            safe_width, safe_height, needs_adjustment = self._validate_dimensions_for_attention(first_frame_width, first_frame_height)
+            
+            if needs_adjustment and use_xformers != "force":
+                print(f"ComfyUI-NormalCrafter: Detected potentially problematic dimensions ({first_frame_width}x{first_frame_height}). "
+                      f"Adjusting to safe dimensions ({safe_width}x{safe_height}) for flash attention compatibility.")
+                # Re-resize ALL frames in effective_frames_for_pipeline to safe dimensions
+                # This ensures padded frames also get resized
+                for i in range(len(effective_frames_for_pipeline)):
+                    if isinstance(effective_frames_for_pipeline[i], Image.Image):
+                        effective_frames_for_pipeline[i] = effective_frames_for_pipeline[i].resize((safe_width, safe_height), LANCZOS)
+                    else:
+                        # Handle case where frame might not be a PIL Image
+                        print(f"ComfyUI-NormalCrafter: Warning - frame {i} is not a PIL Image, skipping resize")
+
+        # Final safety check: ensure all frames have the same dimensions
+        if effective_frames_for_pipeline:
+            reference_size = None
+            all_same_size = True
+            
+            for i, frame in enumerate(effective_frames_for_pipeline):
+                if isinstance(frame, Image.Image):
+                    if reference_size is None:
+                        reference_size = frame.size
+                    elif frame.size != reference_size:
+                        all_same_size = False
+                        print(f"ComfyUI-NormalCrafter: Frame {i} has size {frame.size}, expected {reference_size}")
+                        
+            if not all_same_size and reference_size:
+                print(f"ComfyUI-NormalCrafter: Ensuring all frames are {reference_size} for consistency")
+                for i in range(len(effective_frames_for_pipeline)):
+                    if isinstance(effective_frames_for_pipeline[i], Image.Image):
+                        if effective_frames_for_pipeline[i].size != reference_size:
+                            effective_frames_for_pipeline[i] = effective_frames_for_pipeline[i].resize(reference_size, LANCZOS)
+
+        output_frames_np = None
+        error_occurred = False
+        
+        # Try processing with current settings
+        try:
+            with torch.inference_mode():
+                output_frames_np = self.pipe( # self.pipe should be on processing_device here
+                    images=effective_frames_for_pipeline,
+                    decode_chunk_size=decode_chunk_size,
+                    time_step_size=time_step_size,
+                    window_size=window_size,
+                    fps=default_fps_for_time_ids,
+                    motion_bucket_id=default_motion_bucket_id,
+                    noise_aug_strength=default_noise_aug_strength,
+                    generator=generator
+                    # SVD pipeline has its own progress bar, no need to pass pbar here
+                ).frames[0]
+        except RuntimeError as e:
+            if "CUDA error" in str(e) and "invalid configuration argument" in str(e) and use_xformers != "disable":
+                print(f"ComfyUI-NormalCrafter: Flash attention error encountered: {str(e)}")
+                error_occurred = True
+                
+                # Try disabling xformers and retrying
+                if hasattr(self.pipe, 'disable_xformers_memory_efficient_attention'):
+                    print("ComfyUI-NormalCrafter: Attempting to disable xformers and retry...")
+                    self.pipe.disable_xformers_memory_efficient_attention()
+                    
+                    try:
+                        with torch.inference_mode():
+                            output_frames_np = self.pipe(
+                                images=effective_frames_for_pipeline,
+                                decode_chunk_size=decode_chunk_size,
+                                time_step_size=time_step_size,
+                                window_size=window_size,
+                                fps=default_fps_for_time_ids,
+                                motion_bucket_id=default_motion_bucket_id,
+                                noise_aug_strength=default_noise_aug_strength,
+                                generator=generator
+                            ).frames[0]
+                        print("ComfyUI-NormalCrafter: Successfully processed without xformers.")
+                    except Exception as retry_error:
+                        print(f"ComfyUI-NormalCrafter: Retry without xformers also failed: {retry_error}")
+                        raise retry_error
+                    
+                    # Re-enable xformers for future runs if it was auto mode
+                    if use_xformers == "auto":
+                        try:
+                            self.pipe.enable_xformers_memory_efficient_attention()
+                        except:
+                            pass
+                else:
+                    raise e
+            else:
+                raise e
+        
+        if output_frames_np is None:
+            raise RuntimeError("ComfyUI-NormalCrafter: Failed to generate output frames.")
 
         if len(effective_frames_for_pipeline) > num_actual_frames:
             output_frames_np = output_frames_np[:num_actual_frames, :, :, :]
