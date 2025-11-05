@@ -305,14 +305,14 @@ class NormalCrafterNode:
         imgs = images.to(device, non_blocking=True).permute(0, 3, 1, 2)  # (B,C,H,W)
         _, _, H, W = imgs.shape
 
-        # 1. Erst mal auf max_res_dim runterskalieren (falls nötig)
+        # 1. Scale down to max_res_dim (if necessary
         if max(H, W) > max_res_dim:
             scale = max_res_dim / max(H, W)
             target_h, target_w = int(round(H * scale)), int(round(W * scale))
         else:
             target_h, target_w = H, W
 
-        # 2. Attention-Safe-Dimensionen erzwingen (Vielfaches von 8, min 16)
+        # 2. Enforce Attention-Safe-Dimension (minimum 64)
         min_dim = 64
         align = 64
         target_h = max(min_dim, ((target_h + align - 1) // align) * align)
@@ -362,7 +362,7 @@ class NormalCrafterNode:
         orig_h, orig_w = images.shape[1:3]
         resized_tensor = self.make_safe_size(images, max_res_dimension, processing_device)
 
-        # Anzahl Frames aus Tensor bestimmen
+        # Get number of frames in the tensor
         num_actual_frames = resized_tensor.shape[0]
  
 
@@ -457,11 +457,11 @@ class NormalCrafterNode:
             output_frames_pt = output_frames_pt[:num_actual_frames, ...]
 
 
-        # Output von NormalCrafter: [B,C,H,W]
-        # 1. Normieren nach [0,1]
+        # Output from NormalCrafter has the pattern: [B,C,H,W]
+        # 1. Normalize to a range of [0,1]
         output_frames_pt = (output_frames_pt.clamp(-1., 1.) * 0.5) + 0.5
 
-        # 2. Resize zurück zur Eingangsauflösung
+        # 2. Resize back to input-resolution
         output_frames_pt = F.interpolate(
             output_frames_pt,
             size=(orig_h, orig_w),   # Eingangsauflösung
@@ -469,7 +469,7 @@ class NormalCrafterNode:
             align_corners=False
         )
 
-        # 3. Zurück nach [B,H,W,C] für ComfyUI
+        # 3. Permute Tensor to [B,H,W,C] for ComfyUI-Compatibility
         output_frames_pt = output_frames_pt.permute(0, 2, 3, 1).contiguous()
 
 
